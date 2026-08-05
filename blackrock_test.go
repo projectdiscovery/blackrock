@@ -1,6 +1,8 @@
 package blackrock
 
 import (
+	"math"
+	"math/rand"
 	"reflect"
 	"testing"
 )
@@ -173,5 +175,147 @@ func TestUnfeSubtractsRoundOutput(t *testing.T) {
 
 	if !exercised {
 		t.Fatal("no input reached the F(j, L, seed) > R branch, the test no longer covers it")
+	}
+}
+
+// testPrimes mirrors the table F builds internally. Keeping a copy here lets the
+// tests below recompute what F is supposed to return without exporting it.
+var testPrimes = []int64{961752031, 982324657, 15485843, 961752031}
+
+// fReference recomputes F in unsigned arithmetic, where wrapping is defined by
+// the spec rather than by the width of a mantissa. Signed and unsigned +, *, ^
+// and << agree bit for bit on two's complement, so this is the exact value F
+// must produce once the sign bit is cleared.
+func fReference(j, r, seed int64) int64 {
+	u := uint64(r)
+	u = (u << (u & 0x4)) + u + uint64(seed)
+	v := ((uint64(testPrimes[j])*u + 25) ^ u) + uint64(j)
+
+	return int64(v & math.MaxInt64)
+}
+
+// F must return the exact integer result, not one that has been rounded off by
+// a trip through float64. Only values above 2^53 can catch this: below that the
+// mantissa still holds every bit, so a rounding implementation passes.
+func TestFKeepsFullPrecision(t *testing.T) {
+	rnd := rand.New(rand.NewSource(1))
+	blackrock := New(1000, 1)
+
+	aboveMantissa := 0
+	for i := 0; i < 200000; i++ {
+		j := int64(i%3) + 1
+		r := rnd.Int63()
+		seed := testSeeds[i%len(testSeeds)]
+
+		want := fReference(j, r, seed)
+		if got := blackrock.F(j, r, seed); got != want {
+			t.Fatalf("F(%d, %d, %d) = %d, want %d", j, r, seed, got, want)
+		}
+		if want > 1<<53 {
+			aboveMantissa++
+		}
+	}
+
+	if aboveMantissa == 0 {
+		t.Fatal("no result exceeded 2^53, the test no longer covers the rounding case")
+	}
+}
+
+// Callers feed F straight into (L + F) % a, so a negative result would push the
+// whole round out of [0, a) and break the permutation. The raw expression F is
+// built from is negative about half the time, which is exactly what the sign bit
+// mask has to absorb.
+func TestFIsNeverNegative(t *testing.T) {
+	rnd := rand.New(rand.NewSource(2))
+	blackrock := New(1000, 1)
+
+	rawNegative := 0
+	for i := 0; i < 200000; i++ {
+		j := int64(i%3) + 1
+		r := rnd.Int63()
+		if i%2 == 0 {
+			r = -r
+		}
+		seed := testSeeds[i%len(testSeeds)]
+
+		got := blackrock.F(j, r, seed)
+		if got < 0 {
+			t.Fatalf("F(%d, %d, %d) = %d, want a non-negative result", j, r, seed, got)
+		}
+
+		// The unmasked expression, to confirm the mask is doing real work.
+		u := uint64(r)
+		u = (u << (u & 0x4)) + u + uint64(seed)
+		if int64(((uint64(testPrimes[j])*u+25)^u)+uint64(j)) < 0 {
+			rawNegative++
+		}
+	}
+
+	if rawNegative == 0 {
+		t.Fatal("no input produced a negative raw value, the test no longer covers the mask")
+	}
+}
+
+// maxWorkingRange is the largest range New can build a split for. Above it
+// A*B overflows int64 and the loop in New never terminates, so the tests stop
+// here on purpose.
+const maxWorkingRange = 9223372033963249497
+
+// Ranges past 2^53 are where a rounded round function would start handing back
+// values that no longer round trip. The domains are far too large to walk, so
+// each one is sampled, and both directions are checked: Shuffle must land inside
+// the range and UnShuffle must take it back, and the same in reverse.
+func TestShuffleUnShuffleLargeRanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		rangez int64
+	}{
+		{name: "2^40", rangez: 1 << 40},
+		{name: "2^53, the float64 mantissa limit", rangez: 1 << 53},
+		{name: "just past 2^53", rangez: 1<<53 + 12345},
+		{name: "2^62", rangez: 1 << 62},
+		{name: "5e18", rangez: 5000000000000000000},
+		{name: "largest range New can split", rangez: maxWorkingRange},
+	}
+
+	const samples = 2000
+
+	for _, tt := range tests {
+		for _, seed := range testSeeds {
+			t.Run(tt.name, func(t *testing.T) {
+				blackrock := New(tt.rangez, seed)
+				rnd := rand.New(rand.NewSource(seed))
+
+				for i := 0; i < samples; i++ {
+					m := rnd.Int63n(tt.rangez)
+					switch i {
+					case 0:
+						m = 0
+					case 1:
+						m = tt.rangez - 1
+					}
+
+					shuffled := blackrock.Shuffle(m)
+					if shuffled < 0 || shuffled >= tt.rangez {
+						t.Fatalf("Shuffle(%d) = %d, out of range [0, %d) (seed %d)", m, shuffled, tt.rangez, seed)
+					}
+					if got := blackrock.UnShuffle(shuffled); got != m {
+						t.Fatalf("UnShuffle(Shuffle(%d)) = %d, want %d (range %d, seed %d)",
+							m, got, m, tt.rangez, seed)
+					}
+
+					// UnShuffle is reachable on its own, so it has to invert in
+					// the other direction as well.
+					unshuffled := blackrock.UnShuffle(m)
+					if unshuffled < 0 || unshuffled >= tt.rangez {
+						t.Fatalf("UnShuffle(%d) = %d, out of range [0, %d) (seed %d)", m, unshuffled, tt.rangez, seed)
+					}
+					if got := blackrock.Shuffle(unshuffled); got != m {
+						t.Fatalf("Shuffle(UnShuffle(%d)) = %d, want %d (range %d, seed %d)",
+							m, got, m, tt.rangez, seed)
+					}
+				}
+			})
+		}
 	}
 }
